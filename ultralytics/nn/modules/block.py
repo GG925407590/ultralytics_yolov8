@@ -46,6 +46,9 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
+    "CGBlock",
+    "C2f_Context",
+    "SEAM",
 )
 
 
@@ -355,7 +358,7 @@ class BottleneckCSP(nn.Module):
         self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
-        self.act = nn.SiLU()
+        self.act = nn.LeakyReLU(0.1)  # NPU-compatible
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
@@ -705,7 +708,7 @@ class RepVGGDW(torch.nn.Module):
         self.conv = Conv(ed, ed, 7, 1, 3, g=ed, act=False)
         self.conv1 = Conv(ed, ed, 3, 1, 1, g=ed, act=False)
         self.dim = ed
-        self.act = nn.SiLU()
+        self.act = nn.LeakyReLU(0.1)  # NPU-compatible
 
     def forward(self, x):
         """
@@ -945,3 +948,90 @@ class SCDown(nn.Module):
             (torch.Tensor): Output tensor after applying the SCDown module.
         """
         return self.cv2(self.cv1(x))
+
+
+# ==================== NPU Adaptation: CGBlock + C2f_Context ====================
+
+class CGBlock(nn.Module):
+    """
+    Context-Guided Block for NPU-compatible global context modeling.
+    Three branches: local DWConv, dilated Conv, global avg pool.
+    All ops compatible with Rockchip RV1126B NPU.
+    """
+
+    def __init__(self, c1, c2, shortcut=True, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)  # 降维
+        # 分支1: 深度可分离卷积 (局部细节)
+        self.local = DWConv(c_, c_, 3, 1)
+        # 分支2: 空洞卷积 (周围上下文)
+        self.dilated = Conv(c_, c_, 3, 1, d=3)
+        # 分支3: 全局池化 → 1x1 Conv (无BN, 1x1特征图BN不稳定) → LeakyReLU → 上采样
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.global_conv = nn.Conv2d(c_, c_, 1, 1, bias=False)
+        self.global_act = nn.LeakyReLU(0.1)
+        # 融合后的投影层
+        self.cv2 = Conv(c_ * 3, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        identity = x
+        x = self.cv1(x)
+        h, w = x.shape[2:]
+        local_feat = self.local(x)
+        dilated_feat = self.dilated(x)
+        global_feat = self.global_act(self.global_conv(self.pool(x)))
+        global_feat = torch.nn.functional.interpolate(global_feat, size=(h, w), mode='bilinear', align_corners=False)
+        fused = torch.cat([local_feat, dilated_feat, global_feat], dim=1)
+        out = self.cv2(fused)
+        return out + identity if self.add else out
+
+
+class C2f_Context(nn.Module):
+    """
+    C2f variant using CGBlock instead of Bottleneck.
+    All ops NPU-compatible.
+    """
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(CGBlock(self.c, self.c, shortcut, e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+# ==================== NPU Adaptation: SEAM ====================
+
+class SEAM(nn.Module):
+    """
+    Spatial Enhanced Attention Module for occlusion handling.
+    Three dilated DWConv branches → spatial attention → residual.
+    All ops NPU-compatible (DWConv, Sigmoid, element-wise ops).
+    """
+
+    def __init__(self, c1):
+        super().__init__()
+        self.branch1 = DWConv(c1, c1, 3, 1, d=1)  # 膨胀率1
+        self.branch2 = DWConv(c1, c1, 3, 1, d=2)  # 膨胀率2
+        self.branch3 = DWConv(c1, c1, 3, 1, d=3)  # 膨胀率3
+        self.fuse = Conv(c1 * 3, 1, 1, 1)         # 融合 + 降维到1通道
+        self.act = nn.Sigmoid()                    # 空间注意力
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        attention = self.act(self.fuse(torch.cat([b1, b2, b3], dim=1)))  # (B, 1, H, W)
+        return x * attention + x  # 残差连接

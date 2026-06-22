@@ -25,11 +25,13 @@ from ultralytics.nn.modules import (
     BottleneckCSP,
     C2f,
     C2fAttn,
+    C2f_Context,
     C2fCIB,
     C3Ghost,
     C3x,
     CBFuse,
     CBLinear,
+    CGBlock,
     Classify,
     Concat,
     Conv,
@@ -45,6 +47,7 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Pose,
+    Pose_DWC,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -52,6 +55,7 @@ from ultralytics.nn.modules import (
     ResNetLayer,
     RTDETRDecoder,
     SCDown,
+    SEAM,
     Segment,
     WorldDetect,
     v10Detect,
@@ -925,6 +929,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C1,
             C2,
             C2f,
+            C2f_Context,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -967,9 +972,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[1] if args[3] else args[1] * 4
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
+        elif m is SEAM:
+            args = [ch[f]]  # SEAM takes (c1) only
+            c2 = ch[f]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+        elif m in {Detect, WorldDetect, Segment, Pose, Pose_DWC, OBB, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)

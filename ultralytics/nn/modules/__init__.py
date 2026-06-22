@@ -38,10 +38,12 @@ from .block import (
     C2f,
     C2fAttn,
     C2fCIB,
+    C2f_Context,
     C3Ghost,
     C3x,
     CBFuse,
     CBLinear,
+    CGBlock,
     ContrastiveHead,
     GhostBottleneck,
     HGBlock,
@@ -53,6 +55,7 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    SEAM,
 )
 from .conv import (
     CBAM,
@@ -69,7 +72,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, Pose, Pose_DWC, RTDETRDecoder, Segment, WorldDetect, v10Detect
 from .transformer import (
     AIFI,
     MLP,
@@ -111,9 +114,11 @@ __all__ = (
     "C3",
     "C2f",
     "C2fAttn",
+    "C2f_Context",
     "C3x",
     "C3TR",
     "C3Ghost",
+    "CGBlock",
     "GhostBottleneck",
     "Bottleneck",
     "BottleneckCSP",
@@ -121,6 +126,7 @@ __all__ = (
     "Detect",
     "Segment",
     "Pose",
+    "Pose_DWC",
     "Classify",
     "TransformerEncoderLayer",
     "RepC3",
@@ -150,4 +156,5 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
+    "SEAM",
 )

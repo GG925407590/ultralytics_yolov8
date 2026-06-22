@@ -11,11 +11,11 @@ from torch.nn.init import constant_, xavier_uniform_
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
 from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
-from .conv import Conv
+from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "Segment", "Pose", "Pose_DWC", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
 
 
 class Detect(nn.Module):
@@ -636,3 +636,48 @@ class v10Detect(Detect):
             for x in ch
         )
         self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+# ==================== NPU Adaptation: Pose_DWC ====================
+
+class Pose_DWC(Pose):
+    """
+    Pose head with 7x7 DWConv spatial interaction (NPU-safe alternative to Self-Attention).
+    Inherits all YOLOv8 Pose functionality, adds large-kernel depth-wise conv branch
+    for long-range keypoint coordination (e.g. wrist-elbow-shoulder).
+    """
+
+    def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
+        super().__init__(nc, kpt_shape, ch)
+        c_ = max(ch[0] // 4, self.nk)
+        # 7x7 DWConv 分支: 对每个尺度独立做大核空间交互
+        self.spatial = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c_, 1, 1),     # 降维
+                DWConv(c_, c_, 7, 1),   # 7x7 深度可分离卷积 (空间交互)
+                Conv(c_, x, 1, 1),      # 升维回原通道
+            ) for x in ch
+        )
+
+    def forward(self, x):
+        bs = x[0].shape[0]
+        x_sp = [x[i] + self.spatial[i](x[i]) for i in range(self.nl)]  # 残差融合
+        kpt = torch.cat([self.cv4[i](x_sp[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)
+
+        if self.export and self.format == 'rknn':
+            output_x = Detect.forward(self, x_sp, 'Pose')
+            y = []
+            y.append(output_x)
+            self.export = False
+            x_out = Detect.forward(self, x_sp)
+            self.export = True
+            pred_kpt = self.kpts_decode(bs, kpt)
+            y.append(pred_kpt)
+            return y
+        else:
+            x_out = Detect.forward(self, x_sp)
+
+        if self.training:
+            return x_out, kpt
+        pred_kpt = self.kpts_decode(bs, kpt)
+        return torch.cat([x_out, pred_kpt], 1) if self.export else (torch.cat([x_out[0], pred_kpt], 1), (x_out[1], kpt))

@@ -154,6 +154,140 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+# ==================== COCO 17-keypoint skeleton (0-indexed) ====================
+COCO_SKELETON_0IDX = [
+    [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],  # ankles→knees→hips, hips
+    [5, 11], [6, 12], [5, 6],                            # shoulders→hips, shoulders
+    [5, 7], [6, 8], [7, 9], [8, 10],                     # shoulders→elbows→wrists
+    [1, 2], [0, 1], [0, 2], [1, 3], [2, 4],              # eyes→nose, eyes→ears
+    [3, 5], [4, 6],                                       # ears→shoulders
+]
+# NOTE: These are 0-indexed COCO keypoint pairs used for bone length computation.
+
+
+class BoneLoss(nn.Module):
+    """
+    Bone Length Consistency Loss (VideoPose3D style, CVPR 2019).
+    Penalizes deviations between predicted and ground truth bone lengths.
+
+    Reference:
+        Pavllo et al. "3D human pose estimation in video with temporal convolutions
+        and semi-supervised training", CVPR 2019.
+        https://github.com/facebookresearch/VideoPose3D
+    """
+
+    def __init__(self, skeleton):
+        super().__init__()
+        self.register_buffer("pairs", torch.tensor(skeleton, dtype=torch.long))  # (N_bones, 2)
+
+    def forward(self, pred_kpts, gt_kpts, kpt_mask):
+        """
+        Args:
+            pred_kpts: (N, 17, 2) or (N, 17, 3) predicted keypoints (x,y,[vis])
+            gt_kpts:   (N, 17, 2) or (N, 17, 3) ground truth keypoints
+            kpt_mask:  (N, 17) bool mask, True = visible
+
+        Returns:
+            Scalar bone length consistency loss.
+        """
+        # Get bone vectors: (N, N_bones, 2)
+        pred_bones = pred_kpts[..., :2][:, self.pairs[:, 1]] - pred_kpts[..., :2][:, self.pairs[:, 0]]
+        gt_bones = gt_kpts[..., :2][:, self.pairs[:, 1]] - gt_kpts[..., :2][:, self.pairs[:, 0]]
+
+        # Bone lengths
+        pred_len = torch.norm(pred_bones, dim=-1)  # (N, N_bones)
+        gt_len = torch.norm(gt_bones, dim=-1)
+
+        # Only penalize bones where BOTH endpoints are visible
+        bone_mask = kpt_mask[:, self.pairs[:, 0]] & kpt_mask[:, self.pairs[:, 1]]  # (N, N_bones)
+
+        if bone_mask.sum() == 0:
+            return torch.tensor(0.0, device=pred_kpts.device)
+
+        # L1 loss on bone lengths (robust to outliers)
+        loss = F.l1_loss(pred_len[bone_mask], gt_len[bone_mask], reduction='mean')
+        return loss
+
+
+class TemporalConsistencyLoss(nn.Module):
+    """
+    Temporal Consistency Loss (SmoothNet style, ECCV 2022).
+    Penalizes large displacements of keypoints between consecutive frames.
+
+    Reference:
+        Wang et al. "SmoothNet: A Plug-and-Play Network for Refining Human Motion",
+        ECCV 2022. https://github.com/yuliu-github/SmoothNet
+    """
+
+    def __init__(self, beta=1.0):
+        """
+        Args:
+            beta: Scale factor for smooth L1 threshold (SmoothL1 transitions at |x| = beta).
+        """
+        super().__init__()
+        self.beta = beta
+
+    def forward(self, curr_kpts, prev_kpts, kpt_mask):
+        """
+        Args:
+            curr_kpts: (N, 17, 2) or (N, 17, 3) 当前帧关键点
+            prev_kpts: (N, 17, 2) or (N, 17, 3) 前一帧关键点
+            kpt_mask:  (N, 17) bool, True = visible in BOTH frames
+
+        Returns:
+            Scalar temporal consistency loss.
+        """
+        if kpt_mask.sum() == 0:
+            return torch.tensor(0.0, device=curr_kpts.device)
+
+        # SmoothL1 loss per visible keypoint, averaged
+        diff = curr_kpts[..., :2][kpt_mask] - prev_kpts[..., :2][kpt_mask]
+        loss = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=self.beta, reduction='mean')
+        return loss
+
+
+class ConfidenceWeightedKptLoss(nn.Module):
+    """
+    Confidence-Weighted Keypoint Loss (RTMPose style, 2022).
+    Multiply OKS-based keypoint loss by predicted visibility confidence,
+    so high-confidence predictions contribute more to the loss.
+
+    Reference:
+        Jiang et al. "RTMPose: Regional-to-Local Multi-Person Pose Estimation", 2022.
+        https://github.com/open-mmlab/mmpose
+    """
+
+    def __init__(self, sigmas):
+        super().__init__()
+        self.register_buffer("sigmas", sigmas)
+
+    def forward(self, pred_kpts, gt_kpts, kpt_mask, area):
+        """
+        Args:
+            pred_kpts: (N, 17, 3) predicted (x, y, vis_logit)
+            gt_kpts:   (N, 17, 3) ground truth (x, y, vis)
+            kpt_mask:  (N, 17) bool
+            area:       (N, 1) bbox area for OKS normalization
+
+        Returns:
+            Scalar confidence-weighted keypoint loss.
+        """
+        # Euclidean distance
+        d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
+
+        # Per-keypoint normalization factor
+        kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
+
+        # OKS-based loss
+        e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)
+        oks_loss = (1 - torch.exp(-e)) * kpt_mask.float()  # (N, 17)
+
+        # Confidence weight: sigmoid of vis_logit (detached, as in RTMPose)
+        conf_weight = pred_kpts[..., 2].detach().sigmoid()
+
+        return (kpt_loss_factor.view(-1, 1) * oks_loss * conf_weight).mean()
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses."""
 
@@ -454,9 +588,17 @@ class v8PoseLoss(v8DetectionLoss):
         sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
 
+        # --- NPU Adaptation: additional loss terms (optional, controlled by hyp) ---
+        self.bone_loss = BoneLoss(COCO_SKELETON_0IDX if is_pose else [])
+        self.temporal_loss = TemporalConsistencyLoss(beta=1.0)
+        self.conf_kpt_loss = ConfidenceWeightedKptLoss(sigmas=sigmas) if is_pose else None
+        self.prev_kpts = None  # store previous batch's decoded keypoints for temporal loss
+        self.prev_kpts_epoch = -1  # reset each epoch
+        # -------------------------------------------------------------------------
+
     def __call__(self, preds, batch):
         """Calculate the total loss and detach it."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+        loss = torch.zeros(8, device=self.device)  # box, cls, dfl, kpt_loc, kpt_vis, bone, temporal, kpt_conf
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -512,13 +654,37 @@ class v8PoseLoss(v8DetectionLoss):
                 fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
             )
 
+            # --- NPU Adaptation: additional loss terms ---
+
+            # Bone loss: penalize predicted vs ground truth bone lengths
+            if getattr(self.hyp, 'bone', 0.0) > 0:
+                loss[5] = self._compute_bone_loss(
+                    fg_mask, target_gt_idx, keypoints, batch_idx, pred_kpts
+                )
+
+            # Temporal consistency loss: penalize frame-to-frame jitter
+            if getattr(self.hyp, 'temporal', 0.0) > 0:
+                loss[6] = self._compute_temporal_loss(
+                    fg_mask, target_gt_idx, batch_idx, pred_kpts, batch
+                )
+
+            # Confidence-weighted KPT loss (replaces vanilla kpt_location loss)
+            if getattr(self.hyp, 'kpt_conf', 0.0) > 0:
+                loss[7] = self._compute_conf_kpt_loss(
+                    fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
+                )
+            # -------------------------------------------------
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.pose  # pose gain
         loss[2] *= self.hyp.kobj  # kobj gain
         loss[3] *= self.hyp.cls  # cls gain
         loss[4] *= self.hyp.dfl  # dfl gain
+        loss[5] *= getattr(self.hyp, 'bone', 0.0)  # bone gain
+        loss[6] *= getattr(self.hyp, 'temporal', 0.0)  # temporal gain
+        loss[7] *= getattr(self.hyp, 'kpt_conf', 0.0)  # kpt_conf gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, kpt, ..., bone, temp, kptconf)
 
     @staticmethod
     def kpts_decode(anchor_points, pred_kpts):
@@ -595,6 +761,149 @@ class v8PoseLoss(v8DetectionLoss):
                 kpts_obj_loss = self.bce_pose(pred_kpt[..., 2], kpt_mask.float())  # keypoint obj loss
 
         return kpts_loss, kpts_obj_loss
+
+    # --------------- NPU Adaptation: auxiliary loss helpers ---------------
+
+    def _compute_bone_loss(self, fg_mask, target_gt_idx, keypoints, batch_idx, pred_kpts):
+        """
+        Compute bone length consistency loss (VideoPose3D style).
+        Penalizes deviation of predicted bone lengths from ground truth bone lengths.
+        """
+        bs = fg_mask.shape[0]
+        valid_kpts = []
+        valid_pred_kpts = []
+        for b in range(bs):
+            if fg_mask[b].sum() == 0:
+                continue
+            fg_idx = torch.where(fg_mask[b])[0]
+            gt_id = target_gt_idx[b][fg_idx]
+            mask = batch_idx[:, 0] == b
+            gt_kpts_b = keypoints[mask][gt_id.long()]  # (N_fg, 17, 3)
+            pred_kpts_b = pred_kpts[b][fg_idx]          # (N_fg, 17, 3)
+            # Only use keypoints where at least one bone is fully visible
+            for i in range(len(gt_id)):
+                kpt_mask = gt_kpts_b[i, ..., 2] != 0
+                if kpt_mask.sum() >= 4:  # need at least a few visible keypoints
+                    valid_kpts.append(gt_kpts_b[i])
+                    valid_pred_kpts.append(pred_kpts_b[i])
+
+        if not valid_kpts:
+            return torch.tensor(0.0, device=pred_kpts.device)
+
+        gt_stack = torch.stack(valid_kpts)     # (N, 17, 3)
+        pred_stack = torch.stack(valid_pred_kpts)
+        kpt_mask = gt_stack[..., 2] != 0        # (N, 17)
+        return self.bone_loss(pred_stack, gt_stack, kpt_mask)
+
+    def _compute_temporal_loss(self, fg_mask, target_gt_idx, batch_idx, pred_kpts, batch):
+        """
+        Compute temporal consistency loss (SmoothNet style).
+        Penalizes keypoint displacement between consecutive batches.
+        Uses self.prev_kpts stored from previous batch.
+        """
+        if self.prev_kpts is None:
+            # First batch of epoch: store and return 0
+            self._store_prev_kpts(fg_mask, target_gt_idx, batch_idx, pred_kpts, batch)
+            return torch.tensor(0.0, device=pred_kpts.device)
+
+        # Detect if this is a new epoch (batch_idx restarts)
+        if batch["batch_idx"].min().item() == 0 and self.prev_kpts_epoch != getattr(batch, '_epoch', -1):
+            self._store_prev_kpts(fg_mask, target_gt_idx, batch_idx, pred_kpts, batch)
+            return torch.tensor(0.0, device=pred_kpts.device)
+
+        # Extract current frame's best keypoints
+        curr_kpts_list = []    # List of (N_pic, 17, 3)
+        prev_kpts_list = []    # List of (N_pic, 17, 3)
+        kpt_mask_list = []     # List of (N_pic, 17) bool
+
+        bs = fg_mask.shape[0]
+        for b in range(bs):
+            if fg_mask[b].sum() == 0:
+                continue
+            fg_idx = torch.where(fg_mask[b])[0]
+            gt_id = target_gt_idx[b][fg_idx]
+            mask = batch_idx[:, 0] == b
+            gt_kpts_b = batch_idx[mask][..., None]
+            curr_kpts_b = pred_kpts[b][fg_idx]          # (N_fg, 17, 3)
+            kpt_mask_b = gt_kpts_b[..., 2] != 0 if gt_kpts_b.shape[-1] == 3 else \
+                torch.ones(*gt_kpts_b.shape[:2], dtype=torch.bool, device=gt_kpts_b.device)
+
+            if curr_kpts_b.shape[0] == 0:
+                continue
+            # Take best (lowest index = highest confidence) foreground kpt
+            curr_kpts_list.append(curr_kpts_b[0])
+            kpt_mask_list.append(kpt_mask_b[0])
+
+            # Match previous frame: use same batch index
+            prev_idx = self._get_prev_kpts(b)
+            if prev_idx is not None:
+                prev_kpts_list.append(self.prev_kpts[prev_idx])
+
+        if not curr_kpts_list or len(prev_kpts_list) < max(1, len(curr_kpts_list) // 2):
+            self._store_prev_kpts(fg_mask, target_gt_idx, batch_idx, pred_kpts, batch)
+            return torch.tensor(0.0, device=pred_kpts.device)
+
+        curr_stack = torch.stack(curr_kpts_list)
+        prev_stack = torch.stack(prev_kpts_list)
+        mask_stack = torch.stack(kpt_mask_list)
+        # Intersection mask: visible in both frames
+        prev_mask = prev_stack[..., 2] != 0 if prev_stack.shape[-1] == 3 else mask_stack
+        joint_mask = mask_stack & prev_mask
+
+        return self.temporal_loss(curr_stack, prev_stack, joint_mask)
+
+    def _store_prev_kpts(self, fg_mask, target_gt_idx, batch_idx, pred_kpts, batch):
+        """Store decoded keypoints for next iteration's temporal loss."""
+        bs = fg_mask.shape[0]
+        prev_list = []
+        for b in range(bs):
+            if fg_mask[b].sum() == 0:
+                prev_list.append(pred_kpts.new_zeros(1, pred_kpts.shape[-2], pred_kpts.shape[-1]))
+            else:
+                fg_idx = torch.where(fg_mask[b])[0]
+                prev_list.append(pred_kpts[b][fg_idx[0]].detach())
+        self.prev_kpts = torch.stack(prev_list)  # (B, 17, 3)
+
+    def _get_prev_kpts(self, batch_idx):
+        """Retrieve previous batch's keypoint tensor for temporal loss."""
+        if self.prev_kpts is None or batch_idx >= self.prev_kpts.shape[0]:
+            return None
+        return self.prev_kpts[batch_idx]
+
+    def _compute_conf_kpt_loss(self, fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts):
+        """
+        Compute confidence-weighted keypoint loss (RTMPose style).
+        Weights OKS-based loss by sigmoid(pred_visibility_logit).
+        """
+        if self.conf_kpt_loss is None:
+            return torch.tensor(0.0, device=pred_kpts.device)
+
+        batch_idx = batch_idx.flatten()
+        masks = torch.zeros(fg_mask.shape[0], fg_mask.shape[1], dtype=torch.bool, device=fg_mask.device)
+        for i in range(fg_mask.shape[0]):
+            if fg_mask[i].sum() == 0:
+                continue
+            gt_idx = target_gt_idx[i][fg_mask[i]]
+            mask = batch_idx == i
+            for gt_id in torch.unique(gt_idx):
+                matches = (target_gt_idx[i] == gt_id) & fg_mask[i]
+                if matches.sum() > 1:
+                    masks[i][matches] = torch.ones(matches.sum(), dtype=torch.bool, device=masks.device)
+                    break
+            else:
+                masks[i] = fg_mask[i]
+
+        selected_keypoints = torch.cat([keypoints[b][batch_idx == b] for b in range(fg_mask.shape[0])], 0)
+
+        if masks.any():
+            gt_kpt = selected_keypoints[masks]
+            area = xyxy2xywh(target_bboxes[masks])[:, 2:].prod(1, keepdim=True)
+            pred_kpt = pred_kpts[masks]
+            kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] == 3 else torch.full_like(gt_kpt[..., 0], True)
+            return self.conf_kpt_loss(pred_kpt, gt_kpt, kpt_mask, area)
+        return torch.tensor(0.0, device=pred_kpts.device)
+
+    # ---------------------------------------------------------------------
 
 
 class v8ClassificationLoss:
