@@ -659,7 +659,7 @@ class v8PoseLoss(v8DetectionLoss):
             # Bone loss: penalize predicted vs ground truth bone lengths
             if getattr(self.hyp, 'bone', 0.0) > 0:
                 loss[5] = self._compute_bone_loss(
-                    fg_mask, target_gt_idx, keypoints, batch_idx, pred_kpts
+                    fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, pred_kpts
                 )
 
             # Temporal consistency loss: penalize frame-to-frame jitter
@@ -764,10 +764,12 @@ class v8PoseLoss(v8DetectionLoss):
 
     # --------------- NPU Adaptation: auxiliary loss helpers ---------------
 
-    def _compute_bone_loss(self, fg_mask, target_gt_idx, keypoints, batch_idx, pred_kpts):
+    def _compute_bone_loss(self, fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, pred_kpts):
         """
-        Compute bone length consistency loss (VideoPose3D style).
-        Penalizes deviation of predicted bone lengths from ground truth bone lengths.
+        Compute bone length consistency loss.
+        Penalizes predicted bone lengths that deviate from ground truth bone lengths.
+        Only considers keypoints where both endpoints of a bone are visible.
+        Bone connections are defined in self.pairs.
         """
         bs = fg_mask.shape[0]
         valid_kpts = []
@@ -778,8 +780,11 @@ class v8PoseLoss(v8DetectionLoss):
             fg_idx = torch.where(fg_mask[b])[0]
             gt_id = target_gt_idx[b][fg_idx]
             mask = batch_idx[:, 0] == b
-            gt_kpts_b = keypoints[mask][gt_id.long()]  # (N_fg, 17, 3)
-            pred_kpts_b = pred_kpts[b][fg_idx]          # (N_fg, 17, 3)
+            gt_kpts_b = keypoints[mask][gt_id.long()].clone()  # (N_fg, 17, 3), pixel coords
+            pred_kpts_b = pred_kpts[b][fg_idx]                 # (N_fg, 17, 3), anchor-frame coords
+            # Divide GT by stride to match pred_kpts coordinate frame
+            stride_b = stride_tensor[fg_idx]  # (N_fg, 1)
+            gt_kpts_b[..., :2] /= stride_b.view(-1, 1, 1)
             # Only use keypoints where at least one bone is fully visible
             for i in range(len(gt_id)):
                 kpt_mask = gt_kpts_b[i, ..., 2] != 0
@@ -874,31 +879,39 @@ class v8PoseLoss(v8DetectionLoss):
         """
         Compute confidence-weighted keypoint loss (RTMPose style).
         Weights OKS-based loss by sigmoid(pred_visibility_logit).
+
+        Builds batched keypoints (same as calculate_keypoints_loss), then divides
+        GT by stride to match pred_kpts anchor-frame coordinates.
         """
         if self.conf_kpt_loss is None:
             return torch.tensor(0.0, device=pred_kpts.device)
 
-        batch_idx = batch_idx.flatten()
-        masks = torch.zeros(fg_mask.shape[0], fg_mask.shape[1], dtype=torch.bool, device=fg_mask.device)
-        for i in range(fg_mask.shape[0]):
-            if fg_mask[i].sum() == 0:
-                continue
-            gt_idx = target_gt_idx[i][fg_mask[i]]
-            mask = batch_idx == i
-            for gt_id in torch.unique(gt_idx):
-                matches = (target_gt_idx[i] == gt_id) & fg_mask[i]
-                if matches.sum() > 1:
-                    masks[i][matches] = torch.ones(matches.sum(), dtype=torch.bool, device=masks.device)
-                    break
-            else:
-                masks[i] = fg_mask[i]
+        batch_size = fg_mask.shape[0]
+        max_kpts = torch.unique(batch_idx.flatten(), return_counts=True)[1].max()
 
-        selected_keypoints = torch.cat([keypoints[b][batch_idx == b] for b in range(fg_mask.shape[0])], 0)
+        # Build batched keypoints: (B, max_kpts, 17, 3)
+        batched_keypoints = torch.zeros(
+            (batch_size, max_kpts, keypoints.shape[1], keypoints.shape[2]),
+            device=keypoints.device,
+        )
+        for i in range(batch_size):
+            mask = batch_idx.flatten() == i
+            kpts_i = keypoints[mask]
+            batched_keypoints[i, : kpts_i.shape[0]] = kpts_i
 
-        if masks.any():
-            gt_kpt = selected_keypoints[masks]
-            area = xyxy2xywh(target_bboxes[masks])[:, 2:].prod(1, keepdim=True)
-            pred_kpt = pred_kpts[masks]
+        # Gather GT keypoints per anchor via target_gt_idx (B, N_anchors, 17, 3)
+        target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).unsqueeze(-1)
+        selected_kpts = batched_keypoints.gather(
+            1, target_gt_idx_expanded.expand(-1, -1, keypoints.shape[1], keypoints.shape[2])
+        )
+        # Divide GT by stride to match pred_kpts anchor-frame coordinates
+        selected_kpts = selected_kpts.clone()
+        selected_kpts[..., :2] /= stride_tensor.view(1, -1, 1, 1)
+
+        if fg_mask.any():
+            gt_kpt = selected_kpts[fg_mask]
+            area = xyxy2xywh(target_bboxes[fg_mask])[:, 2:].prod(1, keepdim=True)
+            pred_kpt = pred_kpts[fg_mask]
             kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] == 3 else torch.full_like(gt_kpt[..., 0], True)
             return self.conf_kpt_loss(pred_kpt, gt_kpt, kpt_mask, area)
         return torch.tensor(0.0, device=pred_kpts.device)
