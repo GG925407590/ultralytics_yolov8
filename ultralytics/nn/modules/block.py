@@ -358,7 +358,7 @@ class BottleneckCSP(nn.Module):
         self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
-        self.act = nn.LeakyReLU(0.1)  # NPU-compatible
+        self.act = nn.SiLU()
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
@@ -708,7 +708,7 @@ class RepVGGDW(torch.nn.Module):
         self.conv = Conv(ed, ed, 7, 1, 3, g=ed, act=False)
         self.conv1 = Conv(ed, ed, 3, 1, 1, g=ed, act=False)
         self.dim = ed
-        self.act = nn.LeakyReLU(0.1)  # NPU-compatible
+        self.act = nn.SiLU()
 
     def forward(self, x):
         """
@@ -967,10 +967,10 @@ class CGBlock(nn.Module):
         self.local = DWConv(c_, c_, 3, 1)
         # 分支2: 空洞卷积 (周围上下文)
         self.dilated = Conv(c_, c_, 3, 1, d=3)
-        # 分支3: 全局池化 → 1x1 Conv (无BN, 1x1特征图BN不稳定) → LeakyReLU → 上采样
+        # 分支3: 全局池化 → 1x1 Conv (无BN, 1x1特征图BN不稳定) → SiLU → 上采样
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.global_conv = nn.Conv2d(c_, c_, 1, 1, bias=False)
-        self.global_act = nn.LeakyReLU(0.1)
+        self.global_act = nn.SiLU()
         # 融合后的投影层
         self.cv2 = Conv(c_ * 3, c2, 1, 1)
         self.add = shortcut and c1 == c2

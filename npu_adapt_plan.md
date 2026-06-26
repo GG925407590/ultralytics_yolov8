@@ -58,7 +58,12 @@ yolov8n-pose-npu-s5.yaml   # 阶段5产物（+ TSM，可选）
 
 ---
 
-## 阶段 1：基础兼容层（零风险）
+## 阶段 1：基础兼容层（已废弃）
+
+**rknn-toolkit2 v2.3.2 已支持 RV1126B + SiLU 融合，此阶段不需要执行。激活函数保持 SiLU。**
+
+<details>
+<summary>原始计划（已废弃，仅供参考）</summary>
 
 **目标：SiLU → LeakyReLU。保留 P3+P4+P5 三尺度检测（关键点定位需高分辨率特征图）。**
 
@@ -71,6 +76,8 @@ yolov8n-pose-npu-s5.yaml   # 阶段5产物（+ TSM，可选）
 | 1.3 | `ultralytics/nn/modules/conv.py` | L173 | `RepConv.default_act = nn.LeakyReLU(0.1)` |
 | 1.4 | `ultralytics/nn/modules/block.py` | L287 | `BottleneckCSP.act = nn.LeakyReLU(0.1)` |
 | 1.5 | `ultralytics/nn/modules/block.py` | L510 | `RepVGGDW.act = nn.LeakyReLU(0.1)` |
+
+</details>
 
 ### 1.2 新建 s1 YAML
 

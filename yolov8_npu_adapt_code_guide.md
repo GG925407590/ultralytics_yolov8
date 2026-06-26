@@ -1,7 +1,8 @@
 # YOLOv8-pose NPU 适配改造 —— 代码变更详解
 
 > 从原始 YOLOv8-pose 出发，逐阶段改造为可部署在瑞芯微 RV1126B NPU 的模型。
-> 硬约束：推理时所有算子必须是 NPU 原生支持的（Conv、LeakyReLU、DWConv、Sigmoid、逐元素运算、Concat、Upsample 等）。
+> **2025-06 更新：rknn-toolkit2 v2.3.2 已支持 RV1126B + Conv-SiLU 融合。阶段 1 (SiLU→LeakyReLU) 已回退，激活函数保持官方 SiLU。**
+> 硬约束：推理时所有算子必须是 NPU 原生支持的（Conv、SiLU、DWConv、Sigmoid、逐元素运算、Concat、Upsample 等）。
 
 ---
 
@@ -10,13 +11,13 @@
 ```
 原始 YOLOv8-pose
   │
-  ├─ ① 激活函数 SiLU → LeakyReLU        ← RV1126B NPU 不支持 SiLU
+  ├─ ① ~~激活函数 SiLU → LeakyReLU~~          ← 已回退，rknn v2.3.2 支持 SiLU
   ├─ ② C2f_Context（CGBlock 替换 Bottleneck）← 全局上下文建模，抗遮挡
   ├─ ③ SEAM 空间注意力                   ← 用可见特征补偿被遮挡区域
   ├─ ④ Pose_DWC（7x7 DWConv 头增强）     ← 替代 Self-Attention，肢体协调
   └─ ⑤ 三项损失函数增强                      ← 骨骼一致性、时序平滑、置信度加权
 
-以上 ①~④ 影响推理端（NPU），⑤ 仅影响训练端。
+以上 ②~④ 影响推理端（NPU），⑤ 仅影响训练端。
 ```
 
 ---
